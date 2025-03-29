@@ -1,5 +1,5 @@
 # whisper_torch
-An implementation of whisper `turbo` model in torch. Uses the pretrained weights for the `turbo` model.
+An implementation of whisper `turbo` model in torch (class and feed forward method). Uses the pretrained weights for the `turbo` model.
 
 ### Library Versions
 The following library versions were used for this work:
