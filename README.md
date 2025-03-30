@@ -10,4 +10,4 @@ To test and compare inference with original whisper implementation:
 ```
 python3 test.py <audio.wav>
 ```
-Torch model currently produces wildy inaccurate inference on shorter audio clips.
+Torch model currently produces wildy inaccurate inference on shorter audio clips as beam search and otheroptimizations are not yet implemented.
