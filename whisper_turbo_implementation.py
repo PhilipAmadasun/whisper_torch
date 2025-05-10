@@ -12,7 +12,10 @@ class WhisperTurbo:
     that handles all preprocessing and generation
     """
     
-    def __init__(self, device=None):
+    def __init__(self,
+                    device: str | None = None,
+                    weights_path: str | None = None,
+                    save_after_init: bool = False):
         """
         Initialize the model
         """
@@ -21,35 +24,30 @@ class WhisperTurbo:
         
         self.device = device
         print(f"Using device: {device}")
+
         
-        # Load the official model to get dimensions and weights
-        print("Loading official Whisper 'turbo' model...")
-        self.official_model = whisper.load_model("turbo")  # Use turbo directly if available
+        # 1️⃣ Fast path: load pre‑saved weights
+        if weights_path and os.path.exists(weights_path):
+            print(f"Loading weights from {weights_path}")
+            state = torch.load(weights_path, map_location="cpu")      # read first
+            self.official_model = None                                # fast‑path
+            dims = self._dims_from_state(state)                       # NEW
+            self._build_architecture(dims)                            # pass dims
+            self.custom_model.load_state_dict(state)                  # strict=True
+
+            
+        else:
+            # 2️⃣ Slow path (first run): pull OpenAI checkpoint
+            print("Loading official Whisper 'turbo' model…")
+            self.official_model = whisper.load_model("turbo")
+            self._build_architecture()
+            print("Transferring weights…")
+            self._transfer_weights()
+            if save_after_init and weights_path:
+                print(f"Saving adapted state to {weights_path}")
+                torch.save(self.custom_model.state_dict(), weights_path)
+
         
-        # Get model dimensions from the official model
-        dims = ModelDimensions(
-            n_mels=80,  # Whisper's log_mel_spectrogram produces 80 mel bands
-            n_audio_ctx=self.official_model.dims.n_audio_ctx,
-            n_audio_state=self.official_model.dims.n_audio_state,
-            n_audio_head=self.official_model.dims.n_audio_head,  # Use exact value from official model
-            n_audio_layer=self.official_model.dims.n_audio_layer,
-            n_text_ctx=self.official_model.dims.n_text_ctx,
-            n_text_state=self.official_model.dims.n_text_state,
-            n_text_head=self.official_model.dims.n_text_head,  # Use exact value from official model
-            n_text_layer=self.official_model.dims.n_text_layer,
-            n_vocab=self.official_model.dims.n_vocab
-        )
-        
-        # Debugging: Print model dimensions
-        print(f"Model dimensions: {dims}")
-        
-        # Create and load the custom model
-        print("Creating custom Whisper model...")
-        self.custom_model = Whisper(dims)
-        
-        # Transfer weights from official to custom model
-        print("Transferring weights...")
-        self._transfer_weights()
         
         # Move model to device
         self.custom_model = self.custom_model.to(device)
@@ -58,6 +56,42 @@ class WhisperTurbo:
         # Set model to evaluation mode
         self.custom_model.eval()
     
+    def _dims_from_state(self, state):
+        """Return a ModelDimensions whose layer counts match the checkpoint."""
+        def count(prefix):
+            return 1 + max(int(k.split('.')[2])
+                           for k in state if k.startswith(prefix))
+        d0 = ModelDimensions()                 # grab all the other defaults
+        return ModelDimensions(**{
+            **d0.__dict__,
+            "n_audio_layer": count("encoder.blocks."),
+            "n_text_layer":  count("decoder.blocks."),
+        })
+
+    def _build_architecture(self, dims: ModelDimensions | None = None):
+        """Build an empty Whisper skeleton with the requested dimensions."""
+        if dims is None and self.official_model is not None:
+            o = self.official_model.dims
+            dims = ModelDimensions(
+                n_mels=128,
+                n_audio_ctx=o.n_audio_ctx,
+                n_audio_state=o.n_audio_state,
+                n_audio_head=o.n_audio_head,
+                n_audio_layer=o.n_audio_layer,
+                n_text_ctx=o.n_text_ctx,
+                n_text_state=o.n_text_state,
+                n_text_head=o.n_text_head,
+                n_text_layer=o.n_text_layer,
+                n_vocab=o.n_vocab,
+            )
+        elif dims is None:          # happens only in dev/debug
+            dims = ModelDimensions()
+
+        self.custom_model = Whisper(dims).to(self.device)
+
+
+        
+
     def _print_token_info(self):
         """Print information about special tokens"""
         print("\nTokenizer Information:")
@@ -144,8 +178,8 @@ class WhisperTurbo:
         weight_mapping = {}
         
         # Map encoder convolutional layers (skip first conv layer)
-        # weight_mapping["encoder.conv1.weight"] = "encoder.conv1.weight"
-        # weight_mapping["encoder.conv1.bias"] = "encoder.conv1.bias"
+        weight_mapping["encoder.conv1.weight"] = "encoder.conv1.weight"
+        weight_mapping["encoder.conv1.bias"] = "encoder.conv1.bias"
         weight_mapping["encoder.conv2.weight"] = "encoder.conv2.weight"
         weight_mapping["encoder.conv2.bias"] = "encoder.conv2.bias"
         
@@ -241,20 +275,6 @@ class WhisperTurbo:
             else:
                 missing_keys.append(official_key)
         
-        # Special handling for the first convolutional layer
-        try:
-            official_conv1_weight = self.official_model.state_dict()["encoder.conv1.weight"]
-            official_conv1_bias = self.official_model.state_dict()["encoder.conv1.bias"]
-            
-            # If original model used 128 channels and we need 80, we can take the first 80 channels
-            if official_conv1_weight.shape[1] > 80:
-                print("Adapting encoder.conv1 weights to new input dimensions...")
-                new_state_dict["encoder.conv1.weight"] = official_conv1_weight[:, :80, :]
-                new_state_dict["encoder.conv1.bias"] = official_conv1_bias
-            else:
-                print("Cannot adapt conv1 weights, dimensions are incompatible")
-        except (KeyError, IndexError) as e:
-            print(f"Error adapting conv1 weights: {e}")
         
         # Load the new state dict
         missing_custom, unexpected = self.custom_model.load_state_dict(new_state_dict, strict=False)
@@ -266,7 +286,15 @@ class WhisperTurbo:
         if len(missing_custom) > 0:
             print(f"First few missing custom keys: {missing_custom[:3]}")
     
-    def transcribe(self, audio_path, language="en", task="transcribe", verbose=False):
+    def transcribe(
+        self,
+        audio_path: str,
+        language: str | None = None,      # None == “let the model decide”
+        task: str = "transcribe",
+        beam_size: int = 5,
+        temperature: float = 0.0,
+        verbose: bool = False,
+            ):
         """
         Transcribe audio using the custom model
         """
@@ -276,7 +304,7 @@ class WhisperTurbo:
         # Use whisper's preprocessing to ensure proper input format
         audio = load_audio(audio_path)
         audio = pad_or_trim(audio)
-        mel = log_mel_spectrogram(audio)
+        mel = log_mel_spectrogram(audio, n_mels=128)
         mel = torch.unsqueeze(mel, 0).to(self.device)
         
         if verbose:
@@ -285,22 +313,18 @@ class WhisperTurbo:
         
         # For more accurate comparison, try to mimic how the official model works
         try:
-            # First attempt: Use the official model's approach but with our model
-            options = {
-                "language": language,
-                "task": task,
-                # Add other options that might affect the generation
-            }
             
             # Generate tokens
             with torch.no_grad():
                 tokens = self.custom_model.generate(
-                    mel, 
+                    mel,
+                    tokenizer=self.tokenizer,             # ← add this
                     language=language,
                     task=task,
-                    temperature=0.0  # Use greedy decoding
+                    beam_size=beam_size,
+                    temperature=temperature,
                 )
-                
+                        
                 if verbose:
                     print(f"Generated tokens: {tokens}")
                 
@@ -322,7 +346,8 @@ class WhisperTurbo:
         """
         # The official tokenizer's decode() already does the filtering for timestamps.
         # So we just call it:
-        return self.tokenizer.decode(tokens).strip()
+        return self.tokenizer.decode_clean(tokens).strip()
+        #return self.tokenizer.decode(tokens).strip()
 
     
     def compare_with_official(self, audio_path):
@@ -334,24 +359,29 @@ class WhisperTurbo:
         
         # Use official model's own transcribe method
         print("\nRunning official model...")
-        result = self.official_model.transcribe(audio_path)
-        official_transcription = result["text"]
+        official_transcription = None
+
+        if self.official_model is None:
+            self.official_model = whisper.load_model("turbo")
+            result = self.official_model.transcribe(audio_path)
+            official_transcription = result["text"]
         
         print("\nComparison:")
         print(f"Custom:   \"{custom_transcription}\"")
-        print(f"Official: \"{official_transcription}\"")
+        if official_transcription is not None:
+            print(f"Official: \"{official_transcription}\"")
 
-        print(f"Official tokens: {result["tokens"]}")
+        print(f"Official tokens: {result['tokens']}")
         # Also show the token sequences
         audio = load_audio(audio_path)
         audio = pad_or_trim(audio)
-        mel = log_mel_spectrogram(audio)
+        mel = log_mel_spectrogram(audio, n_mels=128)
         mel = torch.unsqueeze(mel, 0).to(self.device)
         
         # Get sequences from both models for direct comparison
         with torch.no_grad():
             # Get custom tokens
-            custom_tokens = self.custom_model.generate(mel, language="en", task="transcribe")
+            custom_tokens = self.custom_model.generate(mel, tokenizer=self.tokenizer, language="en", task="transcribe")
             print(f"\nCustom tokens: {custom_tokens}")
             
             # Get official tokens (by using the same generate function if possible)
