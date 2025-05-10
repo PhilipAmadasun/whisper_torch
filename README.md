@@ -6,8 +6,16 @@ The following library versions were used for this work:
 -    torch                             2.6.0
 -    torchaudio                        2.6.0
 -    transformers                      4.47.1
-To test and compare inference with original whisper implementation:
+
+### Transfer weights and create .pt file 
+```python
+from whisper_turbo_implementation import WhisperTurbo
+WhisperTurbo(save_after_init=True, weights_path='whisper_turbo_128mel.pt')
 ```
-python3 test.py <audio.wav>
+### use .pt weights
+```python
+from whisper_turbo_implementation import WhisperTurbo
+turbo = WhisperTurbo(weights_path="whisper_turbo_128mel.pt")
+print(turbo.transcribe("../test_wav_files/test_audio1.wav", beam_size=1))
 ```
-Torch model currently produces wildy inaccurate inference on shorter audio clips as beam search and other optimizations are not yet implemented.
+
