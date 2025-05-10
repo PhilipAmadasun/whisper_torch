@@ -172,6 +172,14 @@ class Tokenizer:
         """
         return self.encoding.decode(token_ids, **kwargs)
 
+    def decode_clean(self, token_ids):
+        """
+        Like decode(), but strips *all* special tokens (not just timestamps).
+        """
+        specials = {v for v in self.special_tokens.values()}
+        content = [t for t in token_ids if t not in specials]
+        return self.encoding.decode(content)
+
     @cached_property
     def eot(self) -> int:
         return self.encoding.eot_token
