@@ -7,16 +7,16 @@ from typing import Dict, Iterable, Optional
 
 @dataclass
 class ModelDimensions:
-    n_mels: int = 80  # Changed from 128 to 80 to match whisper's log_mel_spectrogram output
-    n_audio_ctx: int = 1500
-    n_audio_state: int = 1280
-    n_audio_head: int = 20  # Must match exactly with the official model
-    n_audio_layer: int = 32
-    n_text_ctx: int = 448
+    n_mels: int   = 128          # we up‑sampled the front‑end
+    n_audio_ctx:  int = 1500     # from the checkpoint shape [1500,1280]
+    n_audio_state:int = 1280
+    n_audio_head: int = 20       # 1280 / 20  = 64‑d heads
+    n_audio_layer:int = 32
+    n_text_ctx:   int = 448      # checkpoint shape [448,1280]
     n_text_state: int = 1280
-    n_text_head: int = 20  # Must match exactly with the official model
-    n_text_layer: int = 4
-    n_vocab: int = 51866
+    n_text_head:  int = 20
+    n_text_layer: int = 32
+    n_vocab:      int = 51866 
 
 
 
@@ -207,7 +207,9 @@ class Whisper(nn.Module):
         return logits
         
     def generate(self, mel, tokenizer=None, language=None, task="transcribe", 
-             beam_size=5, temperature=0.0, max_length=448):
+             beam_size: int = 1,           # 1 == greedy; >1 == beam search
+             temperature: float = 0.0,
+             max_length: int = 448):
         """A more sophisticated generation method that follows Whisper's behavior"""
         device = next(self.parameters()).device
         
@@ -225,38 +227,8 @@ class Whisper(nn.Module):
         prompt_tokens = [sot_token]
         
         # Add language token if specified
-        if language is not None:
-            # Language token mapping - just a basic one for common languages
-            # Note: In Whisper, language tokens follow a specific pattern
-            language_tokens = {
-                "en": 50259,  # English
-                "zh": 50260,  # Chinese
-                "de": 50261,  # German
-                "es": 50262,  # Spanish
-                "ru": 50263,  # Russian
-                "ko": 50264,  # Korean
-                "fr": 50265,  # French
-                "ja": 50266,  # Japanese
-                "pt": 50267,  # Portuguese
-                "tr": 50268,  # Turkish
-                "pl": 50269,  # Polish
-                "ca": 50270,  # Catalan
-                "nl": 50271,  # Dutch
-                "ar": 50272,  # Arabic
-                "sv": 50273,  # Swedish
-                "it": 50274,  # Italian
-                "id": 50275,  # Indonesian
-                "hi": 50276,  # Hindi
-                "fi": 50277,  # Finnish
-                "vi": 50278,  # Vietnamese
-                "he": 50279,  # Hebrew
-                "uk": 50280,  # Ukrainian
-                "el": 50281,  # Greek
-                "ms": 50282,  # Malay
-                "cs": 50283,  # Czech
-            }
-            
-            lang_token = language_tokens.get(language.lower(), 50259)  # Default to English if not found
+        if language is not None and tokenizer is not None:
+            lang_token = tokenizer.to_language_token(language.lower())
             prompt_tokens.append(lang_token)
         
         # Add task token (transcribe or translate)
@@ -265,7 +237,15 @@ class Whisper(nn.Module):
         else:
             task_token = 50358  # transcribe token
         prompt_tokens.append(task_token)
-            
+
+        # NEW ➜ always finish the prompt with <|startoflm|>
+        #     This is exactly what the original OpenAI implementation does.
+        #     Because we later chop these prompt tokens off, the user will
+        #     never see them in the returned transcript.
+        sot_lm = 50360                     # <|startoflm|>
+        prompt_tokens.append(sot_lm)  
+        prompt_tokens.append(tokenizer.no_timestamps)      
+
         # Print prompt tokens for debugging
         print(f"Prompt tokens: {prompt_tokens}")
             
@@ -274,38 +254,37 @@ class Whisper(nn.Module):
         
         # Simple greedy search
         with torch.no_grad():
+            beams = [(torch.tensor([prompt_tokens], device=device), 0.0)]  # (tokens, logprob)
+
             for i in range(max_length - len(prompt_tokens)):
-                # Get causal mask for decoder self-attention
-                # This needs to match expected format in the model
-                seq_len = tokens.shape[1]
-                mask = get_causal_mask(seq_len, device)
-                
-                # Get predictions
-                logits = self.decoder(tokens, audio_features, mask=mask)
-                
-                # Next token prediction
-                if temperature > 0:
-                    probs = F.softmax(logits[:, -1] / temperature, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1)
-                else:
-                    next_token = torch.argmax(logits[:, -1], dim=-1, keepdim=True)
-                
-                # Debug - print token and top probabilities
-                if i < 5 or next_token.item() == eot_token:  # Print first few tokens and EOT
-                    top_tokens = torch.topk(logits[:, -1], 5)
-                    print(f"Step {i}: Selected token {next_token.item()}, Top 5 tokens: {top_tokens.indices[0].tolist()}, Top probs: {F.softmax(top_tokens.values, dim=-1)[0].tolist()}")
-                
-                # Append to the sequence
-                tokens = torch.cat([tokens, next_token], dim=-1)
-                
-                # Stop if we predict the end of transcript token
-                if next_token.item() == eot_token:
+                all_candidates = []
+                for seq, seq_logprob in beams:
+                    seq_len = seq.shape[1]
+                    mask = get_causal_mask(seq_len, device)
+                    logits = self.decoder(seq, audio_features, mask=mask)[:, -1]
+
+                    if temperature > 0:
+                        probs = torch.softmax(logits / temperature, dim=-1)
+                        logprobs = torch.log(probs + 1e-12)
+                    else:
+                        logprobs = torch.log_softmax(logits, dim=-1)
+
+                    topk_logprobs, topk_tokens = torch.topk(logprobs, beam_size, dim=-1)
+
+                    for tok, lp in zip(topk_tokens[0], topk_logprobs[0]):
+                        new_seq = torch.cat([seq, tok.view(1, 1)], dim=-1)
+                        all_candidates.append((new_seq, seq_logprob + lp.item()))
+
+                # keep the best `beam_size` sequences
+                ordered = sorted(all_candidates, key=lambda t: t[1], reverse=True)
+                beams = ordered[:beam_size]
+
+                # early‑stop if every beam ended with </|endoftext|>
+                if all(b[0][0, -1].item() == eot_token for b in beams):
                     break
-                
-                # Safety check - stop if generating too many of the same token
-                if i > 5 and len(tokens[0]) > 6 and tokens[0, -1] == tokens[0, -2] == tokens[0, -3] == tokens[0, -4] == tokens[0, -5]:
-                    print("Warning: Detected repetition, stopping generation")
-                    break
+
+            # choose best beam
+            tokens = beams[0][0]
         
         # Return the generated token sequence (without the prompt)
         return tokens[0].cpu().tolist()[len(prompt_tokens):]
